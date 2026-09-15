@@ -51,17 +51,25 @@ st.markdown(
     """
     <style>
     :root { --azul: #001975; --laranja: #ff5500; }
-    .stApp { background: linear-gradient(180deg, #f4f6fb 0%, #ffffff 40%); }
-    [data-testid="stSidebar"] { background: linear-gradient(180deg, #001975 0%, #00289e 100%); }
+    /* Tema forçado para claro: evita letra branca em fundo branco em outros PCs */
+    .stApp { background: linear-gradient(180deg, #f4f6fb 0%, #ffffff 40%) !important; color: #1a1a2e; }
+    .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp p, .stApp span,
+    .stApp label, .stApp li, .stApp td, .stApp th, .stApp div { color: #1a1a2e; }
+    [data-testid="stSidebar"] { background: linear-gradient(180deg, #001975 0%, #00289e 100%) !important; }
     [data-testid="stSidebar"] * { color: #ffffff !important; }
+    [data-testid="stMetricValue"], [data-testid="stMetricLabel"] { color: #1a1a2e !important; }
+    [data-testid="stTabs"] button p { color: #1a1a2e !important; }
+    [data-testid="stTabs"] button[aria-selected="true"] p { color: #ff5500 !important; }
+    [data-testid="stDataFrame"] *, [data-testid="stDataEditor"] * { color: #1a1a2e; }
     .hero {
         background: linear-gradient(120deg, #001975 0%, #003ba1 70%, #0a4fc4 100%);
         border-radius: 18px; padding: 26px 32px; margin-bottom: 18px;
         display: flex; align-items: center; gap: 22px;
         box-shadow: 0 8px 24px rgba(0, 25, 117, .25);
     }
-    .hero h1 { color: #ffffff; margin: 0; font-size: 2rem; font-weight: 800; }
-    .hero p { color: #ffd9c7; margin: 4px 0 0 0; font-size: 1.02rem; }
+    .hero h1 { color: #ffffff !important; margin: 0; font-size: 2rem; font-weight: 800; }
+    .hero p { color: #ffd9c7 !important; margin: 4px 0 0 0; font-size: 1.02rem; }
+    .card, .card p, .card span, .card label, .card h1, .card h2, .card h3, .card li { color: #1a1a2e !important; }
     .hero img { border-radius: 14px; box-shadow: 0 4px 14px rgba(0,0,0,.35); }
     .card {
         background: #ffffff; border: 1px solid #e6eaf5; border-radius: 14px;
@@ -251,12 +259,39 @@ def processar_dominio(df: pd.DataFrame):
             "CIDADE": texto(via_final.get("localidade", "")) or texto(row.get("Cidade")),
             "BAIRRO": texto(via_final.get("bairro", "")) or texto(row.get("Bairro")),
             "RUA": texto(via_final.get("logradouro", "")) or texto(row.get("Endereço")),
-            "NUMERO": texto(via_final.get("numero", "")) or num_str(row.get("Numero")),
+            "NUMERO": texto(via_final.get("numero", "")) or num_str(row.get("Numero")) or "SN",
             "COMPLEMENTO": texto(via_final.get("complemento", "")) or texto(row.get("Complemento")),
         }
         registros.append(reg)
 
     return pd.DataFrame(registros, columns=COLS_SAIDA)
+
+
+def sanitizar_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Aplica o tratamento padrão (maiúsculas, sem acentos, formatos) às edições manuais."""
+    df = df.copy()
+    for col in df.columns:
+        if col == "E-MAIL":
+            df[col] = df[col].apply(lambda v: texto(v, maiusculo=False))
+        elif col == "CPF/CNPJ":
+            df[col] = df[col].apply(fmt_cpf)
+        elif col == "CELULAR":
+            df[col] = df[col].apply(lambda v: fmt_celular(v)[0])
+        elif col == "SALARIO":
+            df[col] = df[col].apply(fmt_salario)
+        elif col == "CEP":
+            df[col] = df[col].apply(fmt_cep)
+        elif col in ("DATA_ADMISSAO", "DATA_NASCIMENTO"):
+            df[col] = df[col].apply(fmt_data)
+        else:
+            df[col] = df[col].apply(texto)
+    if "OPERACAO" in df.columns:
+        df["OPERACAO"] = "NOVO"
+    if "PAIS" in df.columns:
+        df["PAIS"] = "BRASIL"
+    if "NUMERO" in df.columns:
+        df["NUMERO"] = df["NUMERO"].apply(lambda v: v if str(v).strip() else "SN")
+    return df
 
 
 def validar(df: pd.DataFrame):
@@ -414,17 +449,21 @@ def aba_admissao():
     with st.expander("✏️ Precisa editar alguma informação? Clique aqui (edição manual antes de baixar)"):
         st.caption("Edite as células diretamente na grade abaixo. As cores e o relatório "
                    "de problemas são recalculados automaticamente após a edição.")
+        st.session_state.setdefault("editor_v", 0)
         editado = st.data_editor(
             df_atual, num_rows="dynamic", use_container_width=True, height=420,
-            key="editor_admissao",
+            key=f"editor_admissao_{st.session_state['editor_v']}",
         )
         col_a, col_b = st.columns([1, 4])
         if col_a.button("💾 Salvar edições", type="primary"):
-            st.session_state["df_editado"] = editado
-            st.success("Edições salvas! A pré-visualização e os problemas foram atualizados.")
+            st.session_state["df_editado"] = sanitizar_df(editado)
+            st.session_state["editor_v"] += 1
+            st.success("Edições salvas com o tratamento padrão (maiúsculas, sem acentos, "
+                       "formatos de CPF/celular/CEP/salário). Pré-visualização atualizada!")
             st.rerun()
         if col_b.button("↩️ Descartar edições e voltar ao processamento original"):
             st.session_state["df_editado"] = st.session_state["df_original"].copy()
+            st.session_state["editor_v"] += 1
             st.rerun()
 
     st.markdown('<div class="card">', unsafe_allow_html=True)

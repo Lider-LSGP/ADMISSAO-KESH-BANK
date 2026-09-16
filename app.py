@@ -45,6 +45,7 @@ MAPA_DOMINIO = {
     "LOTACAO": "Descrição Ccusto", "CEP": "Cep", "ESTADO": "UF End", "CIDADE": "Cidade",
     "BAIRRO": "Bairro", "RUA": "Endereço", "NUMERO": "Numero",
     "COMPLEMENTO": "Complemento", "_EMPRESA": "Cód Emp",
+    "_SITUACAO": "Situação", "_DEMISSAO": "Data Demissão",
 }
 MAPA_INTERNO = {
     "NOME": "nome", "CPF/CNPJ": "cnpj_cpf", "DATA_ADMISSAO": "dataadmissao",
@@ -53,6 +54,7 @@ MAPA_INTERNO = {
     "LOTACAO": "nomepostotrabalho", "CEP": "cep", "ESTADO": "uf", "CIDADE": "cidadeparceiro",
     "BAIRRO": "bairro", "RUA": "rua", "NUMERO": "numero",
     "COMPLEMENTO": "complemento", "_EMPRESA": "nomeempresa",
+    "_SITUACAO": "ativo", "_DEMISSAO": "datademissao",
 }
 
 CORES = {"vermelho": "#FFD7D7", "amarelo": "#FFF3BF"}
@@ -288,8 +290,52 @@ def sugerir_empresa(valor, origem: str) -> str:
 # ----------------------------------------------------------------------------
 # PROCESSAMENTO PRINCIPAL (serve para Domínio e Sistema Interno)
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# REGRAS DE EXCLUSÃO / AVISO
+# ----------------------------------------------------------------------------
+def _col_status(df: pd.DataFrame, mapa: dict):
+    """Descobre em qual coluna está a situação do colaborador.
+    A exportação do Domínio às vezes desloca os valores uma coluna à frente
+    a partir de 'Situação', então procuramos pelos valores esperados."""
+    col = mapa.get("_SITUACAO")
+    if not col or col not in df.columns:
+        return None
+    alvo = {"TRABALHANDO", "DEMITIDO", "ATIVO", "INATIVO", "SIM", "NAO"}
+    cols = list(df.columns)
+    i0 = cols.index(col)
+    for c in cols[i0:i0 + 4]:
+        vals = df[c].apply(lambda v: sem_acentos(num_str(v)).strip().upper())
+        if vals.isin(alvo).sum() >= max(1, len(df) // 4):
+            return c
+    return col
+
+
+def esta_ativo(status: str, demissao: str) -> bool:
+    """True se o colaborador está ativo (não demitido)."""
+    if demissao:
+        return False
+    s = sem_acentos(status).strip().upper()
+    if s and s not in ("TRABALHANDO", "SIM", "ATIVO", "S", "1", "TRUE"):
+        return False
+    return True
+
+
+def admissao_mes_anterior(data_adm: str, hoje=None) -> bool:
+    """True se a admissão é de um mês anterior ao mês atual."""
+    if hoje is None:
+        hoje = pd.Timestamp.today()
+    ts = pd.to_datetime(data_adm, dayfirst=True, errors="coerce")
+    if pd.isna(ts):
+        return False
+    mes_atual = hoje.year * 12 + hoje.month
+    mes_adm = ts.year * 12 + ts.month
+    return mes_atual - mes_adm == 1
+
+
 def processar(df: pd.DataFrame, mapa: dict, mapa_emp: dict) -> pd.DataFrame:
-    """Gera o dataframe de saída no layout do Kesh Bank + coluna _EMPRESA."""
+    """Gera o dataframe de saída no layout do Kesh Bank + coluna _EMPRESA.
+    Colaboradores demitidos/inativos são EXCLUÍDOS e listados em
+    st.session_state['excluidos']."""
     df.columns = [str(c).strip() for c in df.columns]
     col_emp = mapa["_EMPRESA"]
 
@@ -314,7 +360,33 @@ def processar(df: pd.DataFrame, mapa: dict, mapa_emp: dict) -> pd.DataFrame:
     barra.empty()
 
     registros = []
+    excluidos = []
+    col_status = _col_status(df, mapa)
+    col_dem = mapa.get("_DEMISSAO")
+    cols_df = list(df.columns)
+    re_data = re.compile(r"\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2}")
     for _, row in df.iterrows():
+        empresa_linha = mapa_emp.get(num_str(row.get(col_emp)), mapa_emp.get(str(row.get(col_emp)), "LIDER LIMPE"))
+        status = num_str(row.get(col_status)) if col_status else ""
+        # Data de demissão: coluna mapeada ou até 3 colunas após a situação
+        # (cobre a exportação do Domínio com colunas deslocadas)
+        demissao = ""
+        candidatas = ([col_dem] if col_dem in cols_df else [])
+        if col_status in cols_df:
+            candidatas += cols_df[cols_df.index(col_status) + 1: cols_df.index(col_status) + 4]
+        for c in candidatas:
+            v = num_str(row.get(c))
+            if re_data.fullmatch(v):
+                demissao = fmt_data(v)
+                break
+        if not esta_ativo(status, demissao):
+            excluidos.append({
+                "Empresa": empresa_linha,
+                "Colaborador": texto(campo(row, "NOME")) or "(SEM NOME)",
+                "Situação": status or "-",
+                "Data Demissão": demissao or "-",
+            })
+            continue
         cep = fmt_cep(campo(row, "CEP"))
         via = info_cep.get(cep) if cep else None
         if not cep:
@@ -329,7 +401,7 @@ def processar(df: pd.DataFrame, mapa: dict, mapa_emp: dict) -> pd.DataFrame:
             cep_final, via_final = cep, via
 
         celular, _status_cel = fmt_celular(campo(row, "CELULAR"))
-        empresa = mapa_emp.get(num_str(row.get(col_emp)), mapa_emp.get(str(row.get(col_emp)), "LIDER LIMPE"))
+        empresa = empresa_linha
 
         reg = {
             "_EMPRESA": empresa,
@@ -354,6 +426,7 @@ def processar(df: pd.DataFrame, mapa: dict, mapa_emp: dict) -> pd.DataFrame:
         }
         registros.append(reg)
 
+    st.session_state["excluidos"] = excluidos
     return sanitizar_df(pd.DataFrame(registros, columns=["_EMPRESA"] + COLS_SAIDA))
 
 
@@ -557,6 +630,34 @@ def aba_admissao():
         st.session_state["editor_v"] = st.session_state.get("editor_v", 0) + 1
 
     df_atual = st.session_state["df_editado"]
+
+    # ---------------- Excluídos automaticamente (demitidos / inativos) ----------------
+    excluidos = st.session_state.get("excluidos", [])
+    if excluidos:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("⛔ Excluídos automaticamente — demitidos / inativos")
+        st.caption("Estes colaboradores constam como DEMITIDOS ou INATIVOS na planilha "
+                   "e foram removidos do resultado — NÃO vão para o CSV.")
+        st.dataframe(pd.DataFrame(excluidos), use_container_width=True,
+                     hide_index=True, height=min(60 + 35 * len(excluidos), 300))
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ---------------- Admissão no mês anterior (decisão do usuário) ----------------
+    mask_ant = df_atual["DATA_ADMISSAO"].apply(admissao_mes_anterior)
+    if mask_ant.any():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("📅 Admitidos no mês anterior — você decide se mantém")
+        st.caption("Estes colaboradores têm data de admissão no mês anterior ao atual. "
+                   "Por padrão eles PERMANECEM no resultado — marque apenas quem deve ser excluído.")
+        for idx in df_atual[mask_ant].index:
+            r = df_atual.loc[idx]
+            if st.checkbox(f"❌ Excluir **{r['NOME']}** ({r['_EMPRESA']}) — admissão {r['DATA_ADMISSAO']}",
+                           key=f"exc_ant_{st.session_state.get('fonte','')}_{idx}"):
+                st.session_state["df_editado"] = st.session_state["df_editado"].drop(index=idx)
+                st.session_state["editor_v"] = st.session_state.get("editor_v", 0) + 1
+                st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+        df_atual = st.session_state["df_editado"]
     flags, problemas = validar(df_atual)
     n_crit = sum(1 for p in problemas if p["Gravidade"] == "Crítico")
     n_aten = sum(1 for p in problemas if p["Gravidade"] == "Atenção")

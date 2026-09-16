@@ -215,6 +215,12 @@ def fmt_data(v) -> str:
     return ts.strftime("%d/%m/%Y") if pd.notna(ts) else ""
 
 
+def fmt_lotacao(v) -> str:
+    """Mantém apenas a parte antes do '-' (ex.: 'SUZANO - PORTARIA' -> 'SUZANO')."""
+    s = texto(v)
+    return s.split("-")[0].strip() if s else ""
+
+
 def fmt_cep(v) -> str:
     d = so_digitos(num_str(v))
     return d.zfill(8) if d else ""
@@ -313,7 +319,7 @@ def processar(df: pd.DataFrame, mapa: dict, mapa_emp: dict) -> pd.DataFrame:
             "E-MAIL": texto(campo(row, "E-MAIL"), maiusculo=False) or EMAIL_PADRAO,
             "CELULAR": celular,
             "SALARIO": fmt_salario(campo(row, "SALARIO")),
-            "LOTACAO": texto(campo(row, "LOTACAO")),
+            "LOTACAO": fmt_lotacao(campo(row, "LOTACAO")),
             "CEP": cep_final,
             "PAIS": "BRASIL",
             "ESTADO": texto(via_final.get("uf", "")) or texto(campo(row, "ESTADO")),
@@ -345,6 +351,8 @@ def sanitizar_df(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].apply(lambda v: fmt_celular(v)[0])
         elif col == "SALARIO":
             df[col] = df[col].apply(fmt_salario)
+        elif col == "LOTACAO":
+            df[col] = df[col].apply(fmt_lotacao)
         elif col == "CEP":
             df[col] = df[col].apply(fmt_cep)
         elif col in ("DATA_ADMISSAO", "DATA_NASCIMENTO"):

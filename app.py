@@ -2,12 +2,16 @@
 """
 ADMISSÃO KESH BANK — Lider Limpe
 App Streamlit para gerar o CSV de cadastro de novos colaboradores admitidos
-no banco Kesh Bank a partir da planilha exportada do sistema Domínio.
+no banco Kesh Bank, a partir da planilha do sistema Domínio ou da planilha
+do Sistema Interno de Admissão (AppLider / "Importar Layout").
+Os resultados são separados por empresa: ATIVA, LIDER LIMPE,
+LIDER MULTISSERVIÇOS e VSP.
 """
 
 import io
 import re
 import unicodedata
+import zipfile
 
 import pandas as pd
 import requests
@@ -28,11 +32,28 @@ COLS_SAIDA = [
     "COMPLEMENTO",
 ]
 
-OBRIGATORIOS = [
-    "OPERACAO", "NOME", "CPF/CNPJ", "DATA_ADMISSAO", "NOME_MAE",
-    "DATA_NASCIMENTO", "E-MAIL", "CELULAR", "SALARIO", "CEP",
-    "ESTADO", "CIDADE", "BAIRRO", "RUA", "NUMERO",
-]
+EMPRESAS = ["ATIVA", "LIDER LIMPE", "LIDER MULTISSERVIÇOS", "VSP"]
+
+# Sugestão de empresa por código do Domínio (Cód Emp) — ajustável na tela
+MAPA_DOMINIO_PADRAO = {1: "VSP", 2: "ATIVA", 3: "LIDER MULTISSERVIÇOS", 4: "LIDER LIMPE"}
+
+# Mapeamento: coluna de saída -> coluna de origem (endereço = fallback quando o CEP não responde)
+MAPA_DOMINIO = {
+    "NOME": "Nome", "CPF/CNPJ": "CPF", "DATA_ADMISSAO": "Admissão",
+    "NOME_MAE": "Nome Mãe", "DATA_NASCIMENTO": "Data nascimento",
+    "E-MAIL": "Email", "CELULAR": "Celular", "SALARIO": "Salário",
+    "LOTACAO": "Descrição Ccusto", "CEP": "Cep", "ESTADO": "UF End", "CIDADE": "Cidade",
+    "BAIRRO": "Bairro", "RUA": "Endereço", "NUMERO": "Numero",
+    "COMPLEMENTO": "Complemento", "_EMPRESA": "Cód Emp",
+}
+MAPA_INTERNO = {
+    "NOME": "nome", "CPF/CNPJ": "cnpj_cpf", "DATA_ADMISSAO": "dataadmissao",
+    "NOME_MAE": "nomemae", "DATA_NASCIMENTO": "datanascimento",
+    "E-MAIL": "email", "CELULAR": "celular", "SALARIO": "salariobase",
+    "LOTACAO": "nomepostotrabalho", "CEP": "cep", "ESTADO": "uf", "CIDADE": "cidadeparceiro",
+    "BAIRRO": "bairro", "RUA": "rua", "NUMERO": "numero",
+    "COMPLEMENTO": "complemento", "_EMPRESA": "nomeempresa",
+}
 
 CORES = {"vermelho": "#FFD7D7", "amarelo": "#FFF3BF"}
 
@@ -69,22 +90,23 @@ st.markdown(
     }
     .hero h1 { color: #ffffff !important; margin: 0; font-size: 2rem; font-weight: 800; }
     .hero p { color: #ffd9c7 !important; margin: 4px 0 0 0; font-size: 1.02rem; }
-    .card, .card p, .card span, .card label, .card h1, .card h2, .card h3, .card li { color: #1a1a2e !important; }
     .hero img { border-radius: 14px; box-shadow: 0 4px 14px rgba(0,0,0,.35); }
     .card {
         background: #ffffff; border: 1px solid #e6eaf5; border-radius: 14px;
         padding: 18px 22px; margin-bottom: 14px;
         box-shadow: 0 2px 8px rgba(0, 25, 117, .06);
     }
-    .pill-ok  { background:#e6f9ed; color:#0c7a3d; border-radius:20px; padding:4px 14px; font-weight:700; }
-    .pill-warn{ background:#fff3bf; color:#9a6b00; border-radius:20px; padding:4px 14px; font-weight:700; }
-    .pill-err { background:#ffd7d7; color:#b30000; border-radius:20px; padding:4px 14px; font-weight:700; }
+    .card, .card p, .card span, .card label, .card h1, .card h2, .card h3, .card li { color: #1a1a2e !important; }
+    .pill-ok  { background:#e6f9ed; color:#0c7a3d !important; border-radius:20px; padding:4px 14px; font-weight:700; }
+    .pill-warn{ background:#fff3bf; color:#9a6b00 !important; border-radius:20px; padding:4px 14px; font-weight:700; }
+    .pill-err { background:#ffd7d7; color:#b30000 !important; border-radius:20px; padding:4px 14px; font-weight:700; }
     div[data-testid="stDownloadButton"] button, .stButton > button {
-        background: linear-gradient(120deg, #ff5500, #ff7733); color: #fff;
+        background: linear-gradient(120deg, #ff5500, #ff7733); color: #fff !important;
         border: none; border-radius: 10px; font-weight: 700; padding: .55rem 1.4rem;
     }
+    div[data-testid="stDownloadButton"] button *, .stButton > button * { color: #fff !important; }
     div[data-testid="stDownloadButton"] button:hover, .stButton > button:hover {
-        background: linear-gradient(120deg, #e04b00, #ff5500); color:#fff;
+        background: linear-gradient(120deg, #e04b00, #ff5500);
     }
     </style>
     """,
@@ -102,7 +124,7 @@ def hero():
             <img src="data:image/png;base64,{b64}" width="86"/>
             <div>
                 <h1>Admissão Kesh Bank</h1>
-                <p>Lider Limpe · Geração automática do CSV de cadastro de novos colaboradores a partir da planilha Domínio</p>
+                <p>Lider Limpe · Geração automática do CSV de cadastro de novos colaboradores (Domínio ou Sistema Interno), separado por empresa</p>
             </div>
         </div>
         """,
@@ -185,7 +207,11 @@ def fmt_salario(v) -> str:
 def fmt_data(v) -> str:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
-    ts = pd.to_datetime(v, dayfirst=True, errors="coerce")
+    s = str(v).strip()
+    if not s or s.lower() in ("nan", "none", "nat"):
+        return ""
+    # Aceita DD/MM/AAAA e AAAA-MM-DD
+    ts = pd.to_datetime(s, dayfirst=("-" not in s[:5]), errors="coerce")
     return ts.strftime("%d/%m/%Y") if pd.notna(ts) else ""
 
 
@@ -208,16 +234,44 @@ def buscar_cep(cep: str):
 
 
 # ----------------------------------------------------------------------------
-# PROCESSAMENTO PRINCIPAL
+# EMPRESAS
 # ----------------------------------------------------------------------------
-def processar_dominio(df: pd.DataFrame):
-    """Gera o dataframe de saída no layout do Kesh Bank."""
+def sugerir_empresa(valor, origem: str) -> str:
+    """Sugere a empresa a partir do Cód Emp (Domínio) ou nomeempresa (Sistema Interno)."""
+    if origem == "dominio":
+        try:
+            cod = int(float(num_str(valor)))
+            return MAPA_DOMINIO_PADRAO.get(cod, "LIDER LIMPE")
+        except Exception:
+            return "LIDER LIMPE"
+    t = sem_acentos(str(valor)).upper()
+    if "MULTISERVICO" in t:
+        return "LIDER MULTISSERVIÇOS"
+    if "ATIVA" in t:
+        return "ATIVA"
+    if "VSP" in t:
+        return "VSP"
+    if "LIDER" in t or "LIMPE" in t:
+        return "LIDER LIMPE"
+    return "LIDER LIMPE"
+
+
+# ----------------------------------------------------------------------------
+# PROCESSAMENTO PRINCIPAL (serve para Domínio e Sistema Interno)
+# ----------------------------------------------------------------------------
+def processar(df: pd.DataFrame, mapa: dict, mapa_emp: dict) -> pd.DataFrame:
+    """Gera o dataframe de saída no layout do Kesh Bank + coluna _EMPRESA."""
     df.columns = [str(c).strip() for c in df.columns]
+    col_emp = mapa["_EMPRESA"]
+
+    def campo(row, saida):
+        col = mapa.get(saida)
+        return row.get(col) if col in df.columns else None
 
     # Pré-busca dos CEPs (com barra de progresso)
     ceps = []
     for _, row in df.iterrows():
-        cep = fmt_cep(row.get("Cep")) or CEP_EMPRESA
+        cep = fmt_cep(campo(row, "CEP")) or CEP_EMPRESA
         if cep not in ceps:
             ceps.append(cep)
     if CEP_EMPRESA not in ceps:
@@ -232,45 +286,57 @@ def processar_dominio(df: pd.DataFrame):
 
     registros = []
     for _, row in df.iterrows():
-        cep = fmt_cep(row.get("Cep"))
+        cep = fmt_cep(campo(row, "CEP"))
         via = info_cep.get(cep) if cep else None
-        if not cep or via is None:
-            cep_final = cep or CEP_EMPRESA
-            via_final = via or info_cep.get(CEP_EMPRESA) or {}
+        if not cep:
+            # Sem CEP na planilha: usa o CEP da empresa e o endereço dele
+            cep_final = CEP_EMPRESA
+            via_final = info_cep.get(CEP_EMPRESA) or {}
+        elif via is None:
+            # CEP informado mas não localizado no ViaCEP: mantém o CEP do
+            # colaborador e usa os dados de endereço da própria planilha
+            cep_final, via_final = cep, {}
         else:
             cep_final, via_final = cep, via
 
-        celular, _status_cel = fmt_celular(row.get("Celular"))
+        celular, _status_cel = fmt_celular(campo(row, "CELULAR"))
+        empresa = mapa_emp.get(num_str(row.get(col_emp)), mapa_emp.get(str(row.get(col_emp)), "LIDER LIMPE"))
 
         reg = {
+            "_EMPRESA": empresa,
             "OPERACAO": "NOVO",
-            "NOME": texto(row.get("Nome")),
-            "CPF/CNPJ": fmt_cpf(row.get("CPF")),
-            "DATA_ADMISSAO": fmt_data(row.get("Admissão")),
-            "NOME_MAE": texto(row.get("Nome Mãe")),
-            "DATA_NASCIMENTO": fmt_data(row.get("Data nascimento")),
-            "E-MAIL": texto(row.get("Email"), maiusculo=False) or EMAIL_PADRAO,
+            "NOME": texto(campo(row, "NOME")),
+            "CPF/CNPJ": fmt_cpf(campo(row, "CPF/CNPJ")),
+            "DATA_ADMISSAO": fmt_data(campo(row, "DATA_ADMISSAO")),
+            "NOME_MAE": texto(campo(row, "NOME_MAE")),
+            "DATA_NASCIMENTO": fmt_data(campo(row, "DATA_NASCIMENTO")),
+            "E-MAIL": texto(campo(row, "E-MAIL"), maiusculo=False) or EMAIL_PADRAO,
             "CELULAR": celular,
-            "SALARIO": fmt_salario(row.get("Salário")),
-            "LOTACAO": texto(row.get("Descrição Ccusto")),
+            "SALARIO": fmt_salario(campo(row, "SALARIO")),
+            "LOTACAO": texto(campo(row, "LOTACAO")),
             "CEP": cep_final,
             "PAIS": "BRASIL",
-            "ESTADO": texto(via_final.get("uf", "")),
-            "CIDADE": texto(via_final.get("localidade", "")) or texto(row.get("Cidade")),
-            "BAIRRO": texto(via_final.get("bairro", "")) or texto(row.get("Bairro")),
-            "RUA": texto(via_final.get("logradouro", "")) or texto(row.get("Endereço")),
-            "NUMERO": texto(via_final.get("numero", "")) or num_str(row.get("Numero")) or "SN",
-            "COMPLEMENTO": texto(via_final.get("complemento", "")) or texto(row.get("Complemento")),
+            "ESTADO": texto(via_final.get("uf", "")) or texto(campo(row, "ESTADO")),
+            "CIDADE": texto(via_final.get("localidade", "")) or texto(campo(row, "CIDADE")),
+            "BAIRRO": texto(via_final.get("bairro", "")) or texto(campo(row, "BAIRRO")),
+            "RUA": texto(via_final.get("logradouro", "")) or texto(campo(row, "RUA")),
+            "NUMERO": texto(via_final.get("numero", "")) or num_str(campo(row, "NUMERO")) or "SN",
+            "COMPLEMENTO": texto(via_final.get("complemento", "")) or texto(campo(row, "COMPLEMENTO")),
         }
         registros.append(reg)
 
-    return pd.DataFrame(registros, columns=COLS_SAIDA)
+    return pd.DataFrame(registros, columns=["_EMPRESA"] + COLS_SAIDA)
 
 
+# ----------------------------------------------------------------------------
+# VALIDAÇÃO / ESTILO / CSV
+# ----------------------------------------------------------------------------
 def sanitizar_df(df: pd.DataFrame) -> pd.DataFrame:
     """Aplica o tratamento padrão (maiúsculas, sem acentos, formatos) às edições manuais."""
     df = df.copy()
     for col in df.columns:
+        if col == "_EMPRESA":
+            continue
         if col == "E-MAIL":
             df[col] = df[col].apply(lambda v: texto(v, maiusculo=False))
         elif col == "CPF/CNPJ":
@@ -306,33 +372,33 @@ def validar(df: pd.DataFrame):
         for col in ["NOME", "CPF/CNPJ", "DATA_ADMISSAO", "NOME_MAE", "DATA_NASCIMENTO"]:
             if not str(row[col]).strip():
                 flags[(i, col)] = "vermelho"
-                problemas.append({"Colaborador": nome, "Campo": col,
+                problemas.append({"Empresa": row["_EMPRESA"], "Colaborador": nome, "Campo": col,
                                   "Situação": "⚠ FALTANDO INFORMAÇÃO", "Gravidade": "Crítico"})
         if row["CPF/CNPJ"] and len(so_digitos(row["CPF/CNPJ"])) != 11:
             flags[(i, "CPF/CNPJ")] = "vermelho"
-            problemas.append({"Colaborador": nome, "Campo": "CPF/CNPJ",
+            problemas.append({"Empresa": row["_EMPRESA"], "Colaborador": nome, "Campo": "CPF/CNPJ",
                               "Situação": "⚠ CPF NÃO TEM 11 DÍGITOS", "Gravidade": "Crítico"})
         if row["CELULAR"] == CELULAR_PADRAO:
             flags[(i, "CELULAR")] = "vermelho"
-            problemas.append({"Colaborador": nome, "Campo": "CELULAR",
+            problemas.append({"Empresa": row["_EMPRESA"], "Colaborador": nome, "Campo": "CELULAR",
                               "Situação": "⚠ CELULAR NÃO INFORMADO — USADO NÚMERO PADRÃO", "Gravidade": "Crítico"})
         elif len(so_digitos(row["CELULAR"])) != 11:
             flags[(i, "CELULAR")] = "amarelo"
-            problemas.append({"Colaborador": nome, "Campo": "CELULAR",
+            problemas.append({"Empresa": row["_EMPRESA"], "Colaborador": nome, "Campo": "CELULAR",
                               "Situação": "CELULAR FORA DO PADRÃO DE 11 DÍGITOS", "Gravidade": "Atenção"})
         # Amarelo — valores padrão assumidos
         if row["E-MAIL"] == EMAIL_PADRAO or not str(row["E-MAIL"]).strip():
             flags[(i, "E-MAIL")] = "amarelo"
-            problemas.append({"Colaborador": nome, "Campo": "E-MAIL",
+            problemas.append({"Empresa": row["_EMPRESA"], "Colaborador": nome, "Campo": "E-MAIL",
                               "Situação": "E-MAIL NÃO INFORMADO — USADO E-MAIL PADRÃO", "Gravidade": "Atenção"})
         if row["CEP"] == CEP_EMPRESA:
             flags[(i, "CEP")] = "amarelo"
-            problemas.append({"Colaborador": nome, "Campo": "CEP",
+            problemas.append({"Empresa": row["_EMPRESA"], "Colaborador": nome, "Campo": "CEP",
                               "Situação": "CEP NÃO LOCALIZADO — USADO CEP DA EMPRESA", "Gravidade": "Atenção"})
         for col in ["ESTADO", "CIDADE", "BAIRRO", "RUA", "NUMERO", "SALARIO"]:
             if not str(row[col]).strip():
                 flags[(i, col)] = "amarelo"
-                problemas.append({"Colaborador": nome, "Campo": col,
+                problemas.append({"Empresa": row["_EMPRESA"], "Colaborador": nome, "Campo": col,
                                   "Situação": "CAMPO VAZIO — VERIFICAR", "Gravidade": "Atenção"})
     return flags, problemas
 
@@ -348,7 +414,22 @@ def estilizar(df: pd.DataFrame, flags: dict):
 
 
 def gerar_csv(df: pd.DataFrame, encoding: str) -> bytes:
-    return df.to_csv(sep=";", index=False, lineterminator="\r\n").encode(encoding)
+    """CSV final no layout Kesh Bank (sem a coluna interna _EMPRESA)."""
+    saida = df.drop(columns=["_EMPRESA"], errors="ignore")
+    return saida.to_csv(sep=";", index=False, lineterminator="\r\n").encode(encoding)
+
+
+def nome_arquivo(empresa: str) -> str:
+    return f"admissao_kesh_bank_{sem_acentos(empresa).replace(' ', '_')}.csv"
+
+
+def gerar_zip(df: pd.DataFrame, encoding: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for empresa in df["_EMPRESA"].unique():
+            sub = df[df["_EMPRESA"] == empresa]
+            z.writestr(nome_arquivo(empresa), gerar_csv(sub, encoding))
+    return buf.getvalue()
 
 
 # ----------------------------------------------------------------------------
@@ -378,38 +459,74 @@ def ler_planilha(upload) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 def aba_admissao():
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("1️⃣ Envie a planilha do sistema Domínio")
+    st.subheader("1️⃣ Escolha a origem e envie a planilha")
+    origem_rotulo = st.radio(
+        "De onde vem a planilha?",
+        ["📊 Domínio (Arquivo Domínio)", "🖥️ Sistema Interno — AppLider (Importar Layout)"],
+        horizontal=True,
+    )
+    origem = "dominio" if origem_rotulo.startswith("📊") else "interno"
     upload = st.file_uploader(
-        "Planilha de empregados exportada do Domínio",
+        "Planilha de empregados" if origem == "dominio" else "Planilha Importar Layout (AppLider)",
         type=["xls", "xlsx", "csv", "txt", "dat"],
-        help="Aceita o arquivo .xls exportado do Domínio (Empregados em Excel) ou CSV/TXT.",
+        help="Domínio: arquivo .xls 'Empregados em Excel'. Sistema Interno: .xlsx 'Importar Layout'.",
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
     if upload is None:
-        st.info("👆 Envie a planilha do Domínio para gerar o cadastro automaticamente.")
+        st.info("👆 Envie a planilha para gerar o cadastro automaticamente.")
         return
 
     try:
-        df_dom = ler_planilha(upload)
+        df_in = ler_planilha(upload)
     except Exception as e:
         st.error(f"Não foi possível ler o arquivo: `{e}`")
         return
+    df_in.columns = [str(c).strip() for c in df_in.columns]
 
-    faltando = [c for c in ["Nome", "CPF", "Admissão", "Nome Mãe", "Data nascimento",
-                            "Email", "Celular", "Salário", "Descrição Ccusto", "Cep"]
-                if c not in df_dom.columns]
+    mapa = MAPA_DOMINIO if origem == "dominio" else MAPA_INTERNO
+    obrig_origem = [mapa[c] for c in ["NOME", "CPF/CNPJ", "DATA_ADMISSAO", "NOME_MAE",
+                                      "DATA_NASCIMENTO", "E-MAIL", "CELULAR", "SALARIO",
+                                      "LOTACAO", "CEP"]]
+    faltando = [c for c in obrig_origem if c not in df_in.columns]
     if faltando:
         st.warning(f"Colunas não encontradas na planilha: `{', '.join(faltando)}` — "
                    "esses campos sairão com os valores padrão.")
 
-    with st.spinner("Processando colaboradores..."):
-        df_out = processar_dominio(df_dom)
+    # ---------------- Identificação das empresas ----------------
+    col_emp = mapa["_EMPRESA"]
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("2️⃣ Confirme a empresa de cada grupo")
+    if col_emp in df_in.columns:
+        chaves = df_in[col_emp].apply(num_str).unique().tolist()
+        st.caption("Empresas detectadas na planilha — confira e ajuste se necessário:")
+        mapa_emp = {}
+        cols = st.columns(min(len(chaves), 4) or 1)
+        for i, chave in enumerate(chaves):
+            sugestao = sugerir_empresa(chave, origem)
+            idx = EMPRESAS.index(sugestao) if sugestao in EMPRESAS else 0
+            rotulo = (f"Cód Emp {chave}" if origem == "dominio" else chave) or "(vazio)"
+            mapa_emp[chave] = cols[i % len(cols)].selectbox(rotulo, EMPRESAS, index=idx,
+                                                            key=f"emp_{origem}_{i}")
+    else:
+        st.caption("A planilha não tem identificação de empresa — escolha para qual empresa vai este lote:")
+        escolha = st.selectbox("Empresa do lote", EMPRESAS, key="emp_unica")
+        mapa_emp = {num_str(v): escolha for v in df_in.iloc[:, 0]}
+        mapa_emp[""] = escolha
+        col_emp = df_in.columns[0]
+        mapa = dict(mapa)
+        mapa["_EMPRESA"] = col_emp
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.session_state["df_original"] = df_out
-    if "df_editado" not in st.session_state or st.session_state.get("fonte") != upload.name:
+    # ---------------- Processamento ----------------
+    chave_fonte = f"{origem}|{upload.name}|{tuple(sorted(mapa_emp.items()))}"
+    if st.session_state.get("fonte") != chave_fonte:
+        with st.spinner("Processando colaboradores..."):
+            df_out = processar(df_in, mapa, mapa_emp)
+        st.session_state["df_original"] = df_out
         st.session_state["df_editado"] = df_out.copy()
-        st.session_state["fonte"] = upload.name
+        st.session_state["fonte"] = chave_fonte
+        st.session_state["editor_v"] = st.session_state.get("editor_v", 0) + 1
 
     df_atual = st.session_state["df_editado"]
     flags, problemas = validar(df_atual)
@@ -417,12 +534,14 @@ def aba_admissao():
     n_aten = sum(1 for p in problemas if p["Gravidade"] == "Atenção")
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("2️⃣ Resultado do processamento")
+    st.subheader("3️⃣ Resultado do processamento")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Colaboradores", len(df_atual))
-    c2.metric("Campos preenchidos automaticamente", "18 colunas")
+    c2.metric("Empresas no lote", df_atual["_EMPRESA"].nunique())
     c3.metric("⚠ Críticos (vermelho)", n_crit)
     c4.metric("Atenção (amarelo)", n_aten)
+    contagem = df_atual["_EMPRESA"].value_counts()
+    st.markdown("**Por empresa:** " + " · ".join(f"`{e}`: **{n}**" for e, n in contagem.items()))
     if n_crit == 0 and n_aten == 0:
         st.markdown('<span class="pill-ok">✅ TUDO CERTO — NENHUM PROBLEMA ENCONTRADO</span>',
                     unsafe_allow_html=True)
@@ -447,37 +566,50 @@ def aba_admissao():
     st.markdown("</div>", unsafe_allow_html=True)
 
     with st.expander("✏️ Precisa editar alguma informação? Clique aqui (edição manual antes de baixar)"):
-        st.caption("Edite as células diretamente na grade abaixo. As cores e o relatório "
-                   "de problemas são recalculados automaticamente após a edição.")
-        st.session_state.setdefault("editor_v", 0)
+        st.caption("Edite as células diretamente na grade abaixo. Ao salvar, tudo passa pelo "
+                   "tratamento padrão (maiúsculas, sem acentos, formatos) e as cores e o "
+                   "relatório de problemas são recalculados automaticamente.")
         editado = st.data_editor(
             df_atual, num_rows="dynamic", use_container_width=True, height=420,
-            key=f"editor_admissao_{st.session_state['editor_v']}",
+            disabled=["_EMPRESA"],
+            key=f"editor_admissao_{st.session_state.get('editor_v', 0)}",
         )
         col_a, col_b = st.columns([1, 4])
         if col_a.button("💾 Salvar edições", type="primary"):
             st.session_state["df_editado"] = sanitizar_df(editado)
-            st.session_state["editor_v"] += 1
+            st.session_state["editor_v"] = st.session_state.get("editor_v", 0) + 1
             st.success("Edições salvas com o tratamento padrão (maiúsculas, sem acentos, "
                        "formatos de CPF/celular/CEP/salário). Pré-visualização atualizada!")
             st.rerun()
         if col_b.button("↩️ Descartar edições e voltar ao processamento original"):
             st.session_state["df_editado"] = st.session_state["df_original"].copy()
-            st.session_state["editor_v"] += 1
+            st.session_state["editor_v"] = st.session_state.get("editor_v", 0) + 1
             st.rerun()
 
+    # ---------------- Downloads por empresa ----------------
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("3️⃣ Baixar o CSV para o Kesh Bank")
+    st.subheader("4️⃣ Baixar os CSVs — separados por empresa")
     enc = st.selectbox("Codificação do arquivo", ["utf-8", "latin-1"], index=0,
                        help="Se o banco não reconhecer o arquivo, tente latin-1.")
-    csv_bytes = gerar_csv(df_atual, enc)
-    st.download_button(
-        "⬇️ BAIXAR CSV DE ADMISSÃO — KESH BANK",
-        data=csv_bytes,
-        file_name="admissao_kesh_bank.csv",
-        mime="text/csv",
-        type="primary",
-    )
+    empresas_lote = df_atual["_EMPRESA"].unique().tolist()
+    cols_dl = st.columns(min(len(empresas_lote), 4) or 1)
+    for i, empresa in enumerate(empresas_lote):
+        sub = df_atual[df_atual["_EMPRESA"] == empresa]
+        cols_dl[i % len(cols_dl)].download_button(
+            f"⬇️ {empresa} ({len(sub)})",
+            data=gerar_csv(sub, enc),
+            file_name=nome_arquivo(empresa),
+            mime="text/csv",
+            type="primary",
+            key=f"dl_{empresa}",
+        )
+    if len(empresas_lote) > 1:
+        st.download_button(
+            "📦 BAIXAR TODOS (ZIP com um CSV por empresa)",
+            data=gerar_zip(df_atual, enc),
+            file_name="admissao_kesh_bank_todas_empresas.zip",
+            mime="application/zip",
+        )
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -558,16 +690,17 @@ def main():
         st.markdown("---")
         st.markdown(
             "**Como usar**\n"
-            "1. Exporte os empregados do Domínio (.xls)\n"
-            "2. Envie na aba **Admissão**\n"
+            "1. Escolha a origem: **Domínio** ou **Sistema Interno**\n"
+            "2. Envie a planilha e confirme as empresas\n"
             "3. Confira os alertas em vermelho/amarelo\n"
-            "4. Edite se precisar e baixe o CSV\n\n"
+            "4. Edite se precisar e baixe **um CSV por empresa**\n\n"
+            "Empresas: **ATIVA · LIDER LIMPE · LIDER MULTISSERVIÇOS · VSP**\n\n"
             "Use a aba **Conversor** para transformar qualquer XLS/TXT/DAT em CSV."
         )
         st.markdown("---")
         st.caption("CEPs consultados automaticamente via ViaCEP.")
 
-    aba1, aba2 = st.tabs(["📋 Admissão — Domínio → Kesh Bank", "🔄 Conversor para CSV"])
+    aba1, aba2 = st.tabs(["📋 Admissão → Kesh Bank", "🔄 Conversor para CSV"])
     with aba1:
         aba_admissao()
     with aba2:

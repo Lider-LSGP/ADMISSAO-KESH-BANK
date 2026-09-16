@@ -165,10 +165,24 @@ def sem_acentos(s: str) -> str:
     )
 
 
+def limpar_especiais(s: str, manter: str = "") -> str:
+    """Remove caracteres especiais, mantendo apenas letras, números, espaço
+    e os caracteres informados em `manter` (ex.: '/' nas datas)."""
+    s = re.sub(r"\s+", " ", s).strip()
+    return "".join(c for c in s if c.isalnum() or c == " " or c in manter)
+
+
 def texto(v, maiusculo=True) -> str:
     s = num_str(v)
     s = sem_acentos(s)
+    s = limpar_especiais(s)
     return s.upper() if maiusculo else s.lower()
+
+
+def fmt_email(v) -> str:
+    s = sem_acentos(num_str(v)).lower()
+    s = re.sub(r"[^a-z0-9@.\-_]", "", s)
+    return s
 
 
 def fmt_cpf(v) -> str:
@@ -177,7 +191,8 @@ def fmt_cpf(v) -> str:
 
 
 def fmt_celular(v):
-    """Retorna (celular, status) — status: ok | padrao | formato."""
+    """Retorna (celular, status). Qualquer erro (vazio, nº de dígitos
+    diferente de 11) -> número padrão. Status: ok | padrao."""
     d = so_digitos(num_str(v))
     if not d:
         return CELULAR_PADRAO, "padrao"
@@ -186,7 +201,7 @@ def fmt_celular(v):
     if len(d) == 12 and d.startswith("0"):
         d = d[1:]
     if len(d) != 11:
-        return d, "formato"
+        return CELULAR_PADRAO, "padrao"
     return d, "ok"
 
 
@@ -213,6 +228,14 @@ def fmt_data(v) -> str:
     # Aceita DD/MM/AAAA e AAAA-MM-DD
     ts = pd.to_datetime(s, dayfirst=("-" not in s[:5]), errors="coerce")
     return ts.strftime("%d/%m/%Y") if pd.notna(ts) else ""
+
+
+def limpar_caracteres(s: str, permitidos: str = "") -> str:
+    """Remove qualquer caractere especial, mantendo letras, números, espaço
+    e os caracteres extras informados em `permitidos`."""
+    if not s:
+        return s
+    return re.sub(r"[^A-Za-z0-9 " + re.escape(permitidos) + "]", "", s)
 
 
 def fmt_lotacao(v) -> str:
@@ -316,7 +339,7 @@ def processar(df: pd.DataFrame, mapa: dict, mapa_emp: dict) -> pd.DataFrame:
             "DATA_ADMISSAO": fmt_data(campo(row, "DATA_ADMISSAO")),
             "NOME_MAE": texto(campo(row, "NOME_MAE")),
             "DATA_NASCIMENTO": fmt_data(campo(row, "DATA_NASCIMENTO")),
-            "E-MAIL": texto(campo(row, "E-MAIL"), maiusculo=False) or EMAIL_PADRAO,
+            "E-MAIL": fmt_email(campo(row, "E-MAIL")) or EMAIL_PADRAO,
             "CELULAR": celular,
             "SALARIO": fmt_salario(campo(row, "SALARIO")),
             "LOTACAO": fmt_lotacao(campo(row, "LOTACAO")),
@@ -331,20 +354,21 @@ def processar(df: pd.DataFrame, mapa: dict, mapa_emp: dict) -> pd.DataFrame:
         }
         registros.append(reg)
 
-    return pd.DataFrame(registros, columns=["_EMPRESA"] + COLS_SAIDA)
+    return sanitizar_df(pd.DataFrame(registros, columns=["_EMPRESA"] + COLS_SAIDA))
 
 
 # ----------------------------------------------------------------------------
 # VALIDAÇÃO / ESTILO / CSV
 # ----------------------------------------------------------------------------
 def sanitizar_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Aplica o tratamento padrão (maiúsculas, sem acentos, formatos) às edições manuais."""
+    """Aplica o tratamento padrão (maiúsculas, sem acentos, sem caracteres
+    especiais, formatos) — usado no processamento e nas edições manuais."""
     df = df.copy()
     for col in df.columns:
         if col == "_EMPRESA":
-            continue
-        if col == "E-MAIL":
-            df[col] = df[col].apply(lambda v: texto(v, maiusculo=False))
+            df[col] = df[col].apply(lambda v: limpar_caracteres(texto(v)))
+        elif col == "E-MAIL":
+            df[col] = df[col].apply(fmt_email)
         elif col == "CPF/CNPJ":
             df[col] = df[col].apply(fmt_cpf)
         elif col == "CELULAR":
@@ -352,13 +376,13 @@ def sanitizar_df(df: pd.DataFrame) -> pd.DataFrame:
         elif col == "SALARIO":
             df[col] = df[col].apply(fmt_salario)
         elif col == "LOTACAO":
-            df[col] = df[col].apply(fmt_lotacao)
+            df[col] = df[col].apply(lambda v: limpar_caracteres(fmt_lotacao(v)))
         elif col == "CEP":
             df[col] = df[col].apply(fmt_cep)
         elif col in ("DATA_ADMISSAO", "DATA_NASCIMENTO"):
             df[col] = df[col].apply(fmt_data)
         else:
-            df[col] = df[col].apply(texto)
+            df[col] = df[col].apply(lambda v: limpar_caracteres(texto(v)))
     if "OPERACAO" in df.columns:
         df["OPERACAO"] = "NOVO"
     if "PAIS" in df.columns:
@@ -390,10 +414,6 @@ def validar(df: pd.DataFrame):
             flags[(i, "CELULAR")] = "vermelho"
             problemas.append({"Empresa": row["_EMPRESA"], "Colaborador": nome, "Campo": "CELULAR",
                               "Situação": "⚠ CELULAR NÃO INFORMADO — USADO NÚMERO PADRÃO", "Gravidade": "Crítico"})
-        elif len(so_digitos(row["CELULAR"])) != 11:
-            flags[(i, "CELULAR")] = "amarelo"
-            problemas.append({"Empresa": row["_EMPRESA"], "Colaborador": nome, "Campo": "CELULAR",
-                              "Situação": "CELULAR FORA DO PADRÃO DE 11 DÍGITOS", "Gravidade": "Atenção"})
         # Amarelo — valores padrão assumidos
         if row["E-MAIL"] == EMAIL_PADRAO or not str(row["E-MAIL"]).strip():
             flags[(i, "E-MAIL")] = "amarelo"
